@@ -58,20 +58,21 @@ impl UserOpsService {
             .clamp(1, self.settings.max_page_size)
     }
 
-    fn parse_iso8601(&self, timestamp: Option<&String>) -> Result<Option<DateTime>, ParseError> {
+    fn parse_iso8601(&self, timestamp: Option<&String>) -> Result<Option<DateTime>, anyhow::Error> {
         match timestamp {
             Some(ts) => {
-                println!("Parsing timestamp: {:?}", ts); // ✅ Debug log
+                tracing::info!("Parsing timestamp: {:?}", ts); // ✅ Debug log
                 // ✅ Try `YYYY-MM-DD HH:MM:SS`
                 if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
                     return Ok(Some(dt));
                 }
     
-                // ❌ If all fails, return None
+                // ❌ If case of parsing error, return None
+                tracing::error!("Failed to parse timestamp");
                 Ok(None)
             }
             None => {
-                println!("No timestamp provided");
+                tracing::info!("No timestamp provided");
                 Ok(None)
             }
         }
@@ -184,8 +185,23 @@ impl UserOps for UserOpsService {
         let factory_filter = inner.factory.parse_filter("factory")?;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
-        let start_time = self.parse_iso8601(inner.start_time.as_ref()).unwrap();
-        let end_time = self.parse_iso8601(inner.end_time.as_ref()).unwrap();
+        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,  // ✅ Handle case where timestamp is `None`
+            Err(e) => {
+                tracing::error!("Start time parsing error: {:?}", e);  // ✅ Log the error
+                None // ✅ Prevents panic, returns `None` instead
+            }
+        };
+
+        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("End time parsing error: {:?}", e);
+                None
+            }
+        };
 
         let (accounts, next_page_token) = repository::account::list_accounts(
             &self.db,
@@ -257,8 +273,23 @@ impl UserOps for UserOpsService {
         let block_number_filter = inner.block_number;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
-        let start_time = self.parse_iso8601(inner.start_time.as_ref()).unwrap();
-        let end_time = self.parse_iso8601(inner.end_time.as_ref()).unwrap();
+        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,  // ✅ Handle case where timestamp is `None`
+            Err(e) => {
+                tracing::error!("Start time parsing error: {:?}", e);  // ✅ Log the error
+                None // ✅ Prevents panic, returns `None` instead
+            }
+        };
+
+        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("End time parsing error: {:?}", e);
+                None
+            }
+        };
 
         let (ops, next_page_token) = repository::user_op::list_user_ops(
             &self.db,
