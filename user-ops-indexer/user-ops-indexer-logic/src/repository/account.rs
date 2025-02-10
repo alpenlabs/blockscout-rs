@@ -80,8 +80,8 @@ SELECT accounts_cte.sender                    as address,
        accounts_cte.creation_timestamp        as creation_timestamp
 FROM accounts_cte
          JOIN accounts_total_cte ON accounts_cte.sender = accounts_total_cte.sender
-WHERE ($4 IS NULL OR accounts_cte.creation_timestamp IS NULL OR accounts_cte.creation_timestamp >= $4)
-AND ($5 IS NULL OR accounts_cte.creation_timestamp IS NULL OR accounts_cte.creation_timestamp <= $5);
+WHERE ($4 IS NULL OR accounts_cte.creation_timestamp >= $4)
+AND ($5 IS NULL OR accounts_cte.creation_timestamp <= $5);
          "#,
         [
             factory_filter.map(|f| f.to_vec()).into(),
