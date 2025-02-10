@@ -63,16 +63,16 @@ impl UserOpsService {
             Some(ts) => {
                 tracing::info!("Parsing timestamp: {:?}", ts); // ✅ Debug log
 
-                // ✅ Try RFC 3339 / ISO 8601 format
-                if let Ok(dt) = ts.parse::<DateTime>() {
-                    return Ok(Some(dt));
-                }
-
                 // ✅ Try `YYYY-MM-DD HH:MM:SS`
                 if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
                     return Ok(Some(dt));
                 }
     
+                // ✅ Try `YYYY-MM-DDTHH:MM:SSZ`
+                if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ") {
+                    return Ok(Some(dt));
+                }
+
                 // ❌ If case of parsing error, return None
                 tracing::error!("Failed to parse timestamp");
                 Ok(None)
