@@ -49,6 +49,8 @@ pub async fn list_accounts(
     factory_filter: Option<Address>,
     page_token: Option<Address>,
     limit: u64,
+    start_time: Option<DateTime>,
+    end_time: Option<DateTime>,
 ) -> Result<(Vec<Account>, Option<Address>), anyhow::Error> {
     let accounts: Vec<Account> = AccountDB::find_by_statement(Statement::from_sql_and_values(
         db.get_database_backend(),
@@ -77,11 +79,16 @@ SELECT accounts_cte.sender                    as address,
        accounts_cte.creation_op_hash          as creation_op_hash,
        accounts_cte.creation_timestamp        as creation_timestamp
 FROM accounts_cte
-         JOIN accounts_total_cte ON accounts_cte.sender = accounts_total_cte.sender"#,
+         JOIN accounts_total_cte ON accounts_cte.sender = accounts_total_cte.sender
+WHERE ($4 IS NULL OR accounts_cte.creation_timestamp >= $4)
+AND ($5 IS NULL OR accounts_cte.creation_timestamp <= $5);
+         "#,
         [
             factory_filter.map(|f| f.to_vec()).into(),
             page_token.unwrap_or(Address::ZERO).to_vec().into(),
             (limit + 1).into(),
+            start_time.into(),
+            end_time.into(),
         ],
     ))
         .all(db)
@@ -143,17 +150,18 @@ mod tests {
     #[tokio::test]
     async fn list_accounts_ok() {
         let db = get_shared_db().await;
+        let end_time: Option<DateTime> = Some(Utc::now());
 
-        let (items, next_page_token) = list_accounts(&db, None, None, 60).await.unwrap();
+        let (items, next_page_token) = list_accounts(&db, None, None, 60, None, end_time).await.unwrap();
         assert_eq!(items.len(), 60);
         assert_ne!(next_page_token, None);
 
-        let (items, next_page_token) = list_accounts(&db, None, next_page_token, 60).await.unwrap();
+        let (items, next_page_token) = list_accounts(&db, None, next_page_token, 60, None, end_time).await.unwrap();
         assert_eq!(items.len(), 40);
         assert_eq!(next_page_token, None);
 
         let factory = Some(address!("00000000000000000000000000000000000000f1"));
-        let (items, next_page_token) = list_accounts(&db, factory, None, 60).await.unwrap();
+        let (items, next_page_token) = list_accounts(&db, factory, None, 60, None, end_time).await.unwrap();
         assert_eq!(items.len(), 10);
         assert_eq!(next_page_token, None);
         assert!(items.iter().all(|a| a.factory == factory))
