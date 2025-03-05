@@ -61,7 +61,7 @@ impl UserOpsService {
     fn parse_iso8601(&self, timestamp: Option<&String>) -> Result<Option<DateTime>, anyhow::Error> {
         match timestamp {
             Some(ts) => {
-                tracing::info!("Parsing timestamp: {:?}", ts); // ✅ Debug log
+                tracing::info!("Parsing timestamp: {:?}", ts);
 
                 // ✅ Try `YYYY-MM-DD HH:MM:SS`
                 if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
@@ -279,7 +279,9 @@ impl UserOps for UserOpsService {
         let block_number_filter = inner.block_number;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
-        let start_time = match self.parse_iso8601(inner.start_time) {
+        let start_time_filter = inner.start_time.parse_filter("start_time");
+        let end_time_filter = inner.end_time.parse_filter("end_time");
+        let start_time = match self.parse_iso8601(start_time_filter.as_ref()) {
             Ok(Some(time)) => Some(time),
             Ok(None) => None,
             Err(e) => {
@@ -288,7 +290,7 @@ impl UserOps for UserOpsService {
             }
         };
 
-        let end_time = match self.parse_iso8601(inner.end_time) {
+        let end_time = match self.parse_iso8601(end_time_filter.as_ref()) {
             Ok(Some(time)) => Some(time),
             Ok(None) => None,
             Err(e) => {
