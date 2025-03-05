@@ -191,7 +191,7 @@ impl UserOps for UserOpsService {
         let factory_filter = inner.factory.parse_filter("factory")?;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
-        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+        let start_time = match self.parse_iso8601(inner.start_time) {
             Ok(Some(time)) => Some(time),
             Ok(None) => None,
             Err(e) => {
@@ -200,7 +200,7 @@ impl UserOps for UserOpsService {
             }
         };
 
-        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+        let end_time = match self.parse_iso8601(inner.end_time) {
             Ok(Some(time)) => Some(time),
             Ok(None) => None,
             Err(e) => {
@@ -279,16 +279,16 @@ impl UserOps for UserOpsService {
         let block_number_filter = inner.block_number;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
-        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+        let start_time = match self.parse_iso8601(inner.start_time) {
             Ok(Some(time)) => Some(time),
-            Ok(None) => None,  // ✅ Handle case where timestamp is `None`
+            Ok(None) => None,
             Err(e) => {
-                tracing::error!("Start time parsing error: {:?}", e);  // ✅ Log the error
+                tracing::error!("Start time parsing error: {:?}", e);
                 None // ✅ Prevents panic, returns `None` instead
             }
         };
 
-        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+        let end_time = match self.parse_iso8601(inner.end_time) {
             Ok(Some(time)) => Some(time),
             Ok(None) => None,
             Err(e) => {
