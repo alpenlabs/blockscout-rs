@@ -1,5 +1,5 @@
 use crate::{proto::user_ops_service_server::UserOpsService as UserOps, settings::ApiSettings};
-use sea_orm::DatabaseConnection;
+use sea_orm::{prelude::DateTime, DatabaseConnection};
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
@@ -56,6 +56,32 @@ impl UserOpsService {
     fn normalize_page_size(&self, size: Option<u32>) -> u32 {
         size.unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, self.settings.max_page_size)
+    }
+
+    fn parse_iso8601(&self, timestamp: Option<&String>) -> Result<Option<DateTime>, anyhow::Error> {
+        match timestamp {
+            Some(ts) => {
+                tracing::info!("Parsing timestamp: {:?}", ts); // ✅ Debug log
+
+                // ✅ Try `YYYY-MM-DD HH:MM:SS`
+                if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+                    return Ok(Some(dt));
+                }
+    
+                // ✅ Try `YYYY-MM-DDTHH:MM:SSZ`
+                if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ") {
+                    return Ok(Some(dt));
+                }
+
+                // ❌ If case of parsing error, return None
+                tracing::error!("Failed to parse timestamp");
+                Ok(None)
+            }
+            None => {
+                tracing::info!("No timestamp provided");
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -165,12 +191,31 @@ impl UserOps for UserOpsService {
         let factory_filter = inner.factory.parse_filter("factory")?;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
+        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("start time parsing error: {:?}", e);
+                None
+            }
+        };
+
+        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("end time parsing error: {:?}", e);
+                None
+            }
+        };
 
         let (accounts, next_page_token) = repository::account::list_accounts(
             &self.db,
             factory_filter,
             page_token,
             page_size as u64,
+            start_time,
+            end_time,
         )
         .await
         .map_err(|err| {
@@ -234,6 +279,23 @@ impl UserOps for UserOpsService {
         let block_number_filter = inner.block_number;
         let page_token = inner.page_token.parse_page_token()?;
         let page_size = self.normalize_page_size(inner.page_size);
+        let start_time = match self.parse_iso8601(inner.start_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,  // ✅ Handle case where timestamp is `None`
+            Err(e) => {
+                tracing::error!("Start time parsing error: {:?}", e);  // ✅ Log the error
+                None // ✅ Prevents panic, returns `None` instead
+            }
+        };
+
+        let end_time = match self.parse_iso8601(inner.end_time.as_ref()) {
+            Ok(Some(time)) => Some(time),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("End time parsing error: {:?}", e);
+                None
+            }
+        };
 
         let (ops, next_page_token) = repository::user_op::list_user_ops(
             &self.db,
@@ -247,6 +309,8 @@ impl UserOps for UserOpsService {
             block_number_filter,
             page_token,
             page_size as u64,
+            start_time,
+            end_time,
         )
         .await
         .map_err(|err| {
