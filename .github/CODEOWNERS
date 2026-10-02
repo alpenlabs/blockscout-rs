@@ -1,0 +1,8 @@
+# Alpen review is required for every change on alpen-main (STR-4483).
+# The repo has outside collaborators with write access; without this, a
+# change to the image sources could merge with no Alpen reviewer.
+* @madan-oss @alexhui01 @stefanopepe
+
+# Alpen-owned CI, image publishing and scan exceptions.
+/.github/ @madan-oss @alexhui01 @stefanopepe
+/.trivyignore.yaml @madan-oss @alexhui01 @stefanopepe
