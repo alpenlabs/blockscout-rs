@@ -1,0 +1,17 @@
+# Pinned base images for alpen-publish-ecr.yml (STR-4483).
+#
+# Format: <image as written in the Dockerfile> <multi-arch index digest>
+# .github/scripts/pin_base_images.py rewrites each FROM line to these digests
+# and fails the build if a Dockerfile uses an image that is not listed here.
+#
+# To bump one: docker buildx imagetools inspect <image>, copy the top-level
+# Digest, and open a PR. Read from alpen-main only, whatever ref is built.
+
+# Rust toolchain + protoc build image, shared by every service.
+ghcr.io/blockscout/services-base:latest sha256:3b002a45f74e9ca91fd17b8984c7ddc1fc0ef8f8a54134ef9091c3df5f9eb750
+
+# Runtime image for user-ops-indexer.
+ubuntu:24.04 sha256:a853f94d226358a79c740cfc7bce0c289748f3fe3488d921d038ccd752c61b60
+
+# Runtime image for stats.
+ubuntu:25.04 sha256:27771fb7b40a58237c98e8d3e6b9ecdd9289cec69a857fccfb85ff36294dac20

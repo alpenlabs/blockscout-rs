@@ -1,0 +1,502 @@
+name: Alpen - Publish Images to ECR
+
+# Builds the Blockscout stats and user-ops-indexer images from this fork and
+# pushes them to the shared-services private ECR, tagged with the full commit
+# SHA, so any running image maps back to its exact source commit (STR-4483).
+# Same flow as alpenlabs/blockscout-fe .github/workflows/alpen-publish-ecr.yml.
+#
+# Three jobs:
+#   plan           - picks which images to build
+#   build_and_scan - builds and scans; has NO AWS access
+#   publish        - pushes the scanned image; the only job with AWS access
+
+on:
+  push:
+    branches:
+      - alpen-main
+    paths:
+      - stats/**
+      - user-ops-indexer/**
+      - proto/**
+      - .github/workflows/alpen-publish-ecr.yml
+      - .github/scripts/render_trivy_summary.py
+      - .github/scripts/pin_base_images.py
+      - .github/alpen-base-images.txt
+      - .trivyignore.yaml
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Which image to build.
+        required: false
+        type: choice
+        options:
+          - all
+          - stats
+          - user-ops-indexer
+        default: all
+      ref:
+        description: Git branch, tag, or commit SHA to build. Defaults to the branch HEAD selected in the UI.
+        required: false
+        type: string
+      scan_mode:
+        description: "enforce = block push on CRITICAL/HIGH vulnerabilities. report = record them, push anyway. Secrets always block."
+        required: false
+        type: choice
+        options:
+          - enforce
+          - report
+        default: enforce
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  DOCKER_PLATFORMS: linux/amd64
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Select images to build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      # Runs must come from alpen-main, so the workflow, the scan gates, the
+      # base-image pins and .trivyignore.yaml are the reviewed ones. inputs.ref
+      # only selects the source to build. The AWS environment's
+      # deployment-branch rule is the real enforcement; this catches a manual
+      # run from the wrong branch.
+      - name: Require a run from alpen-main
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/alpen-main" ]]; then
+            echo "::error::Run this workflow from alpen-main. Use the ref input to choose what to build."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Manual runs build what was asked for. Pushes build only the images
+      # whose sources changed; proto/, the CI files and the scan exceptions
+      # affect both.
+      - name: Select images
+        id: select
+        env:
+          INPUT_SERVICE: ${{ inputs.service }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          selected=()
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            case "${INPUT_SERVICE:-all}" in
+              all) selected=(stats user-ops-indexer) ;;
+              stats | user-ops-indexer) selected=("${INPUT_SERVICE}") ;;
+              *) echo "::error::unknown service"; exit 1 ;;
+            esac
+          elif [[ -z "${BEFORE_SHA}" || "${BEFORE_SHA}" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            selected=(stats user-ops-indexer)
+          else
+            changed="$(git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}")"
+            if grep -qE '^(proto/|\.github/workflows/alpen-publish-ecr\.yml$|\.github/scripts/(render_trivy_summary|pin_base_images)\.py$|\.github/alpen-base-images\.txt$|\.trivyignore\.yaml$)' <<< "${changed}"; then
+              selected=(stats user-ops-indexer)
+            else
+              for service in stats user-ops-indexer; do
+                if grep -q "^${service}/" <<< "${changed}"; then
+                  selected+=("${service}")
+                fi
+              done
+            fi
+          fi
+
+          matrix="$(printf '%s\n' "${selected[@]}" | jq -R . | jq -cs '
+            map(select(length > 0) | {
+              service: .,
+              ecr_repository: (if . == "stats" then "strata/blockscout-stats" else "strata/blockscout-user-ops-indexer" end)
+            })')"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          echo "Selected: ${matrix}"
+
+  # No environment and no id-token permission: this job cannot reach AWS. It
+  # runs the Dockerfile of whatever ref was asked for, so it must not hold
+  # push credentials.
+  build_and_scan:
+    name: Build and Scan (${{ matrix.service }})
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      SERVICE: ${{ matrix.service }}
+      ECR_REPOSITORY: ${{ matrix.ecr_repository }}
+    steps:
+      - name: Validate manual inputs
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_REF}" && ! "${INPUT_REF}" =~ ^[A-Za-z0-9._/@:-]+$ ]]; then
+            echo "::error::ref contains unsupported characters"
+            exit 1
+          fi
+
+      # .trivyignore.yaml, the base-image pins and the scripts come from the
+      # workflow's own ref, so only reviewed code on the publishing branch can
+      # suppress CVEs or change a base image, whatever inputs.ref points to.
+      - name: Checkout workflow ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The requested build ref is used only as Docker build context.
+      - name: Checkout build ref into build-src/
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+          path: build-src
+
+      - name: Resolve build metadata
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          set -euo pipefail
+
+          resolved_sha="$(git -C build-src rev-parse HEAD)"
+
+          # Pushes to alpen-main always enforce the vulnerability gate. An
+          # approved manual run may choose report, same as blockscout-fe.
+          scan_mode="enforce"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${INPUT_SCAN_MODE}" == "report" ]]; then
+            scan_mode="report"
+            echo "::warning::scan_mode=report: image will be pushed even with CRITICAL/HIGH findings"
+          fi
+
+          {
+            echo "CHECKOUT_REF=${INPUT_REF:-${GITHUB_SHA}}"
+            echo "RESOLVED_SHA=${resolved_sha}"
+            echo "IMAGE_TAG=${resolved_sha}"
+            # Registry-free name: the registry address is a secret that only
+            # the publish job can read, and it must not land in the scan
+            # results or SBOM uploaded as artifacts.
+            echo "IMAGE_REF=${ECR_REPOSITORY}:${resolved_sha}"
+            echo "SCAN_MODE=${scan_mode}"
+          } >> "${GITHUB_ENV}"
+
+      # Every base image is rewritten to the digest in alpen-base-images.txt.
+      # Fails here, before any build, if the Dockerfile uses an unlisted image.
+      - name: Pin base images by digest
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/pin_base_images.py \
+            "build-src/${SERVICE}/Dockerfile" .github/alpen-base-images.txt proto \
+            | tee base-images.txt
+          echo "--- FROM lines after pinning ---"
+          grep -niE '^\s*FROM\s' "build-src/${SERVICE}/Dockerfile"
+
+      # The Rust release build plus --load exhausts the runner's default disk.
+      # Same cleanup as alpenlabs/mosaic's .github/actions/cleanup.
+      # https://github.com/actions/runner-images/issues/2840#issuecomment-790492173
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup /opt/ghc \
+            /usr/local/share/boost "${AGENT_TOOLSDIRECTORY}" /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/node_modules
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Build to the local daemon so Trivy scans the image before any push.
+      # The proto context is what upstream's _docker-build-push.yml passes to
+      # every service. mode=max caches the cargo-chef dependency layer too;
+      # ignore-error keeps a cache-service hiccup from failing the build.
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "${DOCKER_PLATFORMS}" \
+            --file "build-src/${SERVICE}/Dockerfile" \
+            --build-context "proto=build-src/proto" \
+            --label "org.opencontainers.image.revision=${RESOLVED_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.alpenlabs.scan-mode=${SCAN_MODE}" \
+            --cache-from "type=gha,scope=blockscout-rs-${SERVICE}" \
+            --cache-to "type=gha,scope=blockscout-rs-${SERVICE},mode=max,ignore-error=true" \
+            --tag "${IMAGE_REF}" \
+            --load \
+            "build-src/${SERVICE}"
+
+      - name: Prepare Trivy inputs
+        run: |
+          mkdir -p trivy-results
+          # Guard for refs that pre-date the file.
+          [[ -f .trivyignore.yaml ]] || echo "vulnerabilities: []" > .trivyignore.yaml
+
+      # Install the Trivy binary once at a pinned version and reuse it for every
+      # format below (same as alpenlabs/strata-bridge .github/actions/trivy-scan).
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: v0.70.0
+          cache: true
+
+      # Secret gate: ALWAYS blocks, in every scan_mode. A leaked credential must
+      # never be published, whatever the vulnerability policy.
+      - name: Scan image for secrets with Trivy (always enforced)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: json
+          output: trivy-results/${{ matrix.service }}.secrets.json
+          scanners: secret
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+          trivyignores: .trivyignore.yaml
+
+      # Vulnerability gate: CRITICAL or HIGH unfixed vulnerabilities fail the run
+      # and nothing is pushed. Only unfixable findings may be excepted, in
+      # .trivyignore.yaml via a CODEOWNERS-reviewed PR. Runs even if the secret
+      # gate failed so the report is always complete.
+      - name: Scan image with Trivy (hard gate)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: json
+          output: trivy-results/${{ matrix.service }}.json
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # Blocks unless an approved manual run chose scan_mode=report.
+          # scan_mode never relaxes the secret gate above.
+          exit-code: ${{ env.SCAN_MODE == 'report' && '0' || '1' }}
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+          trivyignores: .trivyignore.yaml
+
+      # Advisory SBOM — CycloneDX artifact for supply chain tracking.
+      - name: Generate SBOM with Trivy (CycloneDX)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: cyclonedx
+          output: trivy-results/${{ matrix.service }}.sbom.json
+          scanners: vuln
+          exit-code: "0"
+          timeout: 15m
+          hide-progress: true
+          skip-setup-trivy: true
+          trivyignores: .trivyignore.yaml
+
+      # Converts trivy-results/<service>.json → trivy-results/<service>.md,
+      # appended to the run summary below.
+      - name: Render Trivy markdown summary
+        if: always()
+        continue-on-error: true
+        run: python3 .github/scripts/render_trivy_summary.py
+
+      # Bundles JSON, SBOM and Markdown so runs can be compared side by side.
+      - name: Upload Trivy results artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-${{ matrix.service }}-${{ env.IMAGE_TAG }}
+          if-no-files-found: ignore
+          path: |
+            trivy-results/${{ matrix.service }}.json
+            trivy-results/${{ matrix.service }}.secrets.json
+            trivy-results/${{ matrix.service }}.sbom.json
+            trivy-results/${{ matrix.service }}.md
+
+      - name: Append build summary
+        if: always()
+        run: |
+          {
+            echo "## Blockscout ${SERVICE} image build"
+            echo
+            echo "- Checkout ref: \`${CHECKOUT_REF:-unknown}\`"
+            echo "- Resolved SHA: \`${RESOLVED_SHA:-unknown}\`"
+            echo "- Image: \`${IMAGE_REF:-unknown}\`"
+            if [[ "${SCAN_MODE:-enforce}" == "report" ]]; then
+              echo "- Scan mode: \`report\` — CRITICAL/HIGH findings are recorded, not blocking (see below)"
+            else
+              echo "- Scan mode: \`enforce\`"
+            fi
+            echo "- Trivy artifact: \`trivy-${SERVICE}-${IMAGE_TAG:-unknown}\`"
+            echo
+            echo "### Pinned base images"
+            echo
+            if [[ -s base-images.txt ]]; then
+              while IFS= read -r line; do
+                echo "- \`${line}\`"
+              done < base-images.txt
+            else
+              echo "Base images were not pinned."
+            fi
+            echo
+            if [[ -f "trivy-results/${SERVICE}.md" ]]; then
+              cat "trivy-results/${SERVICE}.md"
+            else
+              echo "### Trivy summary"
+              echo
+              echo "Trivy scan output was not generated."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Reached only if both gates passed. Hands the exact image that was
+      # scanned to the publish job, so nothing is rebuilt with AWS access.
+      - name: Export scanned image
+        run: |
+          set -euo pipefail
+          mkdir -p image-out
+          docker save "${IMAGE_REF}" | zstd -T0 -3 -o image-out/image.tar.zst
+          printf '%s\n' "${IMAGE_REF}" > image-out/image-ref.txt
+          ls -lh image-out
+
+      - name: Upload scanned image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.service }}
+          path: image-out/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  # The only job with AWS access. It runs no code from the build ref: it loads
+  # the image that build_and_scan already scanned and pushes it.
+  publish:
+    name: Publish (${{ matrix.service }})
+    needs: [plan, build_and_scan]
+    # Run for each image whose build passed, even if the other one failed.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    # The push role's OIDC trust is scoped to this environment. The role ARN
+    # and registry address are secrets on the environment, not values in this
+    # public repo, so only a job approved for the environment can read them.
+    environment: AWS
+    permissions:
+      id-token: write
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    concurrency:
+      group: alpen-publish-ecr-${{ matrix.service }}-${{ inputs.ref || github.ref }}
+      cancel-in-progress: false
+    env:
+      SERVICE: ${{ matrix.service }}
+      ECR_REPOSITORY: ${{ matrix.ecr_repository }}
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+    steps:
+      - name: Validate environment secrets
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ECR_REGISTRY}" || -z "${AWS_ROLE_TO_ASSUME}" ]]; then
+            echo "::error::Set the ECR_REGISTRY and AWS_ROLE_TO_ASSUME secrets on the AWS environment"
+            exit 1
+          fi
+
+      # Missing when this image's build or scan failed: the job stops here.
+      - name: Download scanned image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.service }}
+          path: image-in
+
+      - name: Resolve image reference
+        run: |
+          set -euo pipefail
+
+          image_ref="$(cat image-in/image-ref.txt)"
+          if [[ ! "${image_ref}" =~ ^${ECR_REPOSITORY}:[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected image reference in the build artifact"
+            exit 1
+          fi
+
+          {
+            echo "IMAGE_REF=${image_ref}"
+            echo "IMAGE_TAG=${image_ref##*:}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Tags are immutable, so a commit that is already published cannot be
+      # pushed again. Skip the push instead of failing on it.
+      - name: Check whether this commit is already published
+        id: published
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${IMAGE_REF} is already published, skipping push"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Push image to private ECR
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          zstd -dc image-in/image.tar.zst | docker load
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          docker tag "${IMAGE_REF}" "${ECR_REGISTRY}/${IMAGE_REF}"
+          docker push "${ECR_REGISTRY}/${IMAGE_REF}"
+
+      - name: Resolve image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Append publish summary
+        if: always()
+        env:
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
+          ALREADY_PUBLISHED: ${{ steps.published.outputs.exists }}
+        run: |
+          {
+            echo "## Blockscout ${SERVICE} image publish"
+            echo
+            echo "- Image: \`${IMAGE_REF:-not built}\`"
+            echo "- Digest: \`${IMAGE_DIGEST:-not pushed}\`"
+            if [[ "${ALREADY_PUBLISHED}" == "true" ]]; then
+              echo "- Already published: push skipped"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
