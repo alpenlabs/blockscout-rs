@@ -1,8 +1,10 @@
-# Trivy ignore file for the alpen-publish-ecr.yml hard gate (CRITICAL/HIGH).
+# Trivy ignore file for alpen-publish-ecr.yml.
 # Same structure as alpenlabs/blockscout-fe .trivyignore.yaml.
 #
-# Only for findings that CANNOT currently be fixed by a dependency bump.
-# Every entry needs a `statement` covering:
+# Vulnerability findings are reported, not blocking, so an entry here only
+# removes a finding from the report. Use it for findings that CANNOT
+# currently be fixed by a dependency bump. Every entry needs a `statement`
+# covering:
 #   - dependency path
 #   - why no fix is reachable
 #   - what an upstream fix needs (links)
@@ -10,5 +12,5 @@
 # Optional `expired_at: YYYY-MM-DD` forces a re-review.
 #
 # Changes need a PR reviewed by CODEOWNERS. Read from alpen-main only, so an
-# unreviewed build ref cannot suppress findings.
+# unreviewed build ref cannot hide findings.
 vulnerabilities: []

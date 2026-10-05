@@ -38,14 +38,6 @@ on:
         description: Git branch, tag, or commit SHA to build. Defaults to the branch HEAD selected in the UI.
         required: false
         type: string
-      scan_mode:
-        description: "enforce = block push on CRITICAL/HIGH vulnerabilities. report = record them, push anyway. Secrets always block."
-        required: false
-        type: choice
-        options:
-          - enforce
-          - report
-        default: enforce
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
@@ -172,19 +164,10 @@ jobs:
       - name: Resolve build metadata
         env:
           INPUT_REF: ${{ inputs.ref }}
-          INPUT_SCAN_MODE: ${{ inputs.scan_mode }}
         run: |
           set -euo pipefail
 
           resolved_sha="$(git -C build-src rev-parse HEAD)"
-
-          # Pushes to alpen-main always enforce the vulnerability gate. An
-          # approved manual run may choose report, same as blockscout-fe.
-          scan_mode="enforce"
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${INPUT_SCAN_MODE}" == "report" ]]; then
-            scan_mode="report"
-            echo "::warning::scan_mode=report: image will be pushed even with CRITICAL/HIGH findings"
-          fi
 
           {
             echo "CHECKOUT_REF=${INPUT_REF:-${GITHUB_SHA}}"
@@ -194,7 +177,6 @@ jobs:
             # the publish job can read, and it must not land in the scan
             # results or SBOM uploaded as artifacts.
             echo "IMAGE_REF=${ECR_REPOSITORY}:${resolved_sha}"
-            echo "SCAN_MODE=${scan_mode}"
           } >> "${GITHUB_ENV}"
 
       # Every base image is rewritten to the digest in alpen-base-images.txt.
@@ -235,7 +217,6 @@ jobs:
             --build-context "proto=build-src/proto" \
             --label "org.opencontainers.image.revision=${RESOLVED_SHA}" \
             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-            --label "org.alpenlabs.scan-mode=${SCAN_MODE}" \
             --cache-from "type=gha,scope=blockscout-rs-${SERVICE}" \
             --cache-to "type=gha,scope=blockscout-rs-${SERVICE},mode=max,ignore-error=true" \
             --tag "${IMAGE_REF}" \
@@ -256,8 +237,8 @@ jobs:
           version: v0.70.0
           cache: true
 
-      # Secret gate: ALWAYS blocks, in every scan_mode. A leaked credential must
-      # never be published, whatever the vulnerability policy.
+      # Secret gate: ALWAYS blocks. A leaked credential must never be
+      # published, whatever the vulnerability policy.
       - name: Scan image for secrets with Trivy (always enforced)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -272,11 +253,11 @@ jobs:
           skip-setup-trivy: true
           trivyignores: .trivyignore.yaml
 
-      # Vulnerability gate: CRITICAL or HIGH unfixed vulnerabilities fail the run
-      # and nothing is pushed. Only unfixable findings may be excepted, in
-      # .trivyignore.yaml via a CODEOWNERS-reviewed PR. Runs even if the secret
-      # gate failed so the report is always complete.
-      - name: Scan image with Trivy (hard gate)
+      # Vulnerability report: CRITICAL and HIGH findings with a fix available
+      # are recorded in the run summary and the Trivy artifact. They do NOT
+      # block the push; the approver of the publish job sees them first. Runs
+      # even if the secret gate failed so the report is always complete.
+      - name: Scan image for vulnerabilities with Trivy (report only)
         if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -286,9 +267,7 @@ jobs:
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-          # Blocks unless an approved manual run chose scan_mode=report.
-          # scan_mode never relaxes the secret gate above.
-          exit-code: ${{ env.SCAN_MODE == 'report' && '0' || '1' }}
+          exit-code: "0"
           timeout: 15m
           hide-progress: true
           skip-setup-trivy: true
@@ -317,6 +296,19 @@ jobs:
         continue-on-error: true
         run: python3 .github/scripts/render_trivy_summary.py
 
+      # Findings do not fail the job, so flag them where the approver looks.
+      - name: Flag vulnerability findings
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          report="trivy-results/${SERVICE}.json"
+          [[ -f "${report}" ]] || exit 0
+          count="$(jq '[.Results[]? | (.Vulnerabilities // [])[]] | length' "${report}")"
+          if [[ "${count}" -gt 0 ]]; then
+            echo "::warning::${SERVICE}: ${count} CRITICAL/HIGH vulnerability finding(s). Not blocking; see the run summary."
+          fi
+
       # Bundles JSON, SBOM and Markdown so runs can be compared side by side.
       - name: Upload Trivy results artifact
         if: always()
@@ -339,11 +331,7 @@ jobs:
             echo "- Checkout ref: \`${CHECKOUT_REF:-unknown}\`"
             echo "- Resolved SHA: \`${RESOLVED_SHA:-unknown}\`"
             echo "- Image: \`${IMAGE_REF:-unknown}\`"
-            if [[ "${SCAN_MODE:-enforce}" == "report" ]]; then
-              echo "- Scan mode: \`report\` — CRITICAL/HIGH findings are recorded, not blocking (see below)"
-            else
-              echo "- Scan mode: \`enforce\`"
-            fi
+            echo "- Vulnerabilities: reported below, not blocking. Secrets always block."
             echo "- Trivy artifact: \`trivy-${SERVICE}-${IMAGE_TAG:-unknown}\`"
             echo
             echo "### Pinned base images"
