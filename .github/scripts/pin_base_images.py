@@ -61,7 +61,14 @@ def main():
             errors.append(f"line {number}: base image {image} uses a build argument and cannot be pinned")
             out.append(line)
         elif "@sha256:" in image:
-            out.append(line)
+            # Already digest-qualified: it must still be one of the reviewed
+            # pins, or a build ref could bring its own unreviewed base image.
+            name, digest = image.split("@", 1)
+            if pins.get(name) == digest:
+                out.append(line)
+            else:
+                errors.append(f"line {number}: base image {image} does not match a pinned digest in {pins_file}")
+                out.append(line)
         elif image in pins:
             out.append(f"{prefix}{flags}{image}@{pins[image]}{rest}")
             print(f"{image} -> {pins[image]}")
